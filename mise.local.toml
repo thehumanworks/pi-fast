@@ -1,0 +1,4 @@
+[tools]
+aube = "latest"
+bun = "latest"
+node = "latest"
