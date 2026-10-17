@@ -35,7 +35,7 @@ on extension reload. This is a user-wide preference shared across projects,
 not part of settings or session history. With no saved preference, the tier is
 `default`. Enable `/fast on` once to keep fast on until you explicitly disable
 it with `/fast off` (or toggle `/fast` again). Ultrafast selections and disabling
-also persist; eligibility checks still apply to every request.
+also persist; provider and model checks still apply to every request.
 
 `--fast` and `--ultrafast` override the saved startup tier and save the new
 selection. If both are present, `--ultrafast` wins. Session changes within the
@@ -48,41 +48,36 @@ session. Writes use atomic file replacement to avoid partial state files.
 Commands affect subsequent requests, not requests already in flight. A footer
 indicator shows the selection.
 
-## Subscription eligibility
+## Ultrafast availability and authentication
 
-Ultrafast requires **both** an allowlisted model and ChatGPT OAuth authentication
-whose active token reports the exact plan `promax` (Pro Max, referred to here as
-Pro500). Ordinary `pro`, `prolite`, Plus, enterprise plans, and API keys are not
-eligible. The literal claim `pro500` is not treated as an alias: the upstream
-plan identifier is `promax`.
+OpenAI documents Ultrafast for GPT-6 Astra and GPT-6.1 Sol with different access
+rules depending on authentication:
 
-The extension resolves the selected model's credentials through Pi's
-`ctx.modelRegistry`, allowing Pi to refresh OAuth credentials normally, and
-locally reads `https://api.openai.com/auth.chatgpt_plan_type` from the JWT payload
-(the namespace is an object key, not a URL the extension calls). It does not
-read a separate auth.json, log tokens, persist account information, or query an
-undocumented account endpoint. Eligibility is rechecked before every ultrafast
-request, so changing accounts or plans cannot leave a stale eligible result.
+- **ChatGPT sign-in (Codex):** Pro $500 (Pro Max / `promax`) and eligible
+  Enterprise and Edu workspaces. Pro $100, Pro $200, Plus, and Business do not
+  have Ultrafast at launch, even with purchased credits. Workspace permissions
+  can also restrict access.
+- **API keys:** Ultrafast is available to all API users on supported models,
+  subject to API rate limits and pricing. A ChatGPT subscription is not required.
 
-Missing/unreadable claims, opaque or expired tokens, API-key authentication,
-and auth-resolution errors **fail closed**: `/ultrafast` cannot be enabled, and
-an existing selection or `--ultrafast` uses `default` with a warning. `/fast`
-remains available and `/ultrafast off` always allows disabling the selection.
-The commands and CLI flag remain registered so ineligible users get an
-explanation rather than an unknown-command error.
+The extension checks only the provider and configured model allowlist locally.
+It does **not** decode OAuth tokens, infer entitlement from a plan claim, or
+reject API-key authentication. An access token can omit the plan claim even
+for a real Pro Max account, and a plan label alone cannot establish workspace
+permissions or API access. Missing, opaque, or expired token contents therefore
+do not disable the selected tier in this extension.
 
-**Detection limitation:** OpenAI's Codex source defines `promax` separately and
-reads the plan claim from its **ID token**. Pi does not retain that ID token.
-This extension can detect the plan only if the resolved **access token** also
-exposes the claim. A real Pro Max account with no readable access-token plan
-claim will therefore remain blocked; there is intentionally no manual bypass.
-JWT decoding is a local eligibility hint, not signature verification or proof
-of server-side entitlement. OpenAI still enforces access, and claims can lag a
-subscription change until the token refreshes.
+Pi remains responsible for resolving credentials and refreshing OAuth tokens.
+The extension does not resolve or inspect credentials, read auth.json, persist
+account information, or query an account endpoint. OpenAI enforces actual
+access on every request; selecting Ultrafast does not grant entitlement. If
+authentication or access is rejected, the provider error is surfaced normally,
+without a silent retry at a different tier.
 
-References checked:
-- [Codex plan identifiers](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/auth.rs)
-- [Codex JWT plan claims](https://github.com/openai/codex/blob/main/codex-rs/login/src/token_data.rs)
+References:
+- [ChatGPT Pro tiers](https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers)
+- [Codex speed modes and workspace requirements](https://learn.chatgpt.com/docs/agent-configuration/speed)
+- [Ultrafast mode in the API](https://developers.openai.com/api/docs/guides/ultrafast-mode)
 
 ## Configure ultrafast models
 
@@ -98,9 +93,9 @@ Add this custom extension setting to Pi's settings.json:
 }
 ```
 
-When `gpt-6.1-sol` is enabled by your endpoint, add it to that array; no code
-change is required. The default, when the setting is absent, is
-`["gpt-6-astra"]`. An empty array disables ultrafast for all models.
+To also use `gpt-6.1-sol`, add it to that array; no code change is required.
+The default, when the setting is absent, is `["gpt-6-astra"]`. An empty array
+disables ultrafast for all models.
 
 Entries are exact, case-sensitive model IDs (covering both supported providers)
 or provider-qualified IDs such as `openai-codex/gpt-6-astra`. No wildcards or
@@ -134,9 +129,9 @@ that either request value resolves to `priority` for models without a distinct
 Fast tier. This extension sends `priority` for `/fast` and `--fast` for
 compatibility with endpoints that do not accept `fast`.
 
-Ultrafast behavior and eligibility checks are unchanged. Endpoint acceptance
-and model availability still depend on server-side access. A rejecting endpoint
-will return an API error; there is no silent retry with a different paid tier.
+Ultrafast is sent only for allowlisted models. Endpoint acceptance and model
+availability still depend on server-side access. A rejecting endpoint will
+return an API error; there is no silent retry with a different paid tier.
 
 Pi's existing service-tier cost adjustments recognize `priority`/`flex`, but
 ultrafast cost estimates may not reflect actual billing. Check actual
@@ -152,6 +147,6 @@ bun test
 
 Tests cover persistent on/off state, startup overrides, storage errors,
 flags, mutually exclusive toggles, configuration, model changes,
-payload preservation, provider isolation, Pro Max eligibility, credential
-changes, API-key rejection, malformed/expired tokens, and safe auth-error
-handling without making network requests.
+payload preservation, provider isolation, opaque OAuth tokens, API-key support,
+credential changes, and leaving token format, expiry, refresh, and entitlement
+to Pi/OpenAI without inspecting credentials or making network requests.

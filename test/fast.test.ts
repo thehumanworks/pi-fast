@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,11 +22,19 @@ async function harness(flags: Record<string, boolean> = {}, initialSettings: unk
     const events = new Map<string, (event: any, ctx: ExtensionContext) => any>();
     const commands = new Map<string, (args: string, ctx: ExtensionCommandContext) => Promise<void>>();
     const notices: string[] = [];
+    const statuses: (string | undefined)[] = [];
     let settings = initialSettings;
     let oauth = true;
-    let token: string | undefined = jwt();
+    let token: string | undefined = "opaque-oauth-token";
     let headers: Record<string, string> | undefined;
     let authError = false;
+    const authMethods = {
+        isUsingOAuth: mock(() => oauth),
+        getApiKeyAndHeaders: mock(async () => {
+            if (authError) throw new Error("sensitive-token-details");
+            return { ok: true, apiKey: token, headers };
+        }),
+    };
     const pi = {
         on: (name: string, handler: any) => events.set(name, handler),
         registerFlag: () => {},
@@ -36,15 +44,12 @@ async function harness(flags: Record<string, boolean> = {}, initialSettings: unk
     } as unknown as ExtensionAPI;
     const ctx = {
         model: { provider: "openai", id: "gpt-6-astra" },
-        modelRegistry: {
-            isUsingOAuth: () => oauth,
-            getApiKeyAndHeaders: async () => {
-                if (authError) throw new Error("sensitive-token-details");
-                return { ok: true, apiKey: token, headers };
-            },
-        },
+        modelRegistry: authMethods,
         hasUI: true,
-        ui: { notify: (message: string) => notices.push(message), setStatus: () => {} },
+        ui: {
+            notify: (message: string) => notices.push(message),
+            setStatus: (_key: string, value: string | undefined) => statuses.push(value),
+        },
     } as unknown as ExtensionCommandContext;
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     try {
@@ -56,7 +61,7 @@ async function harness(flags: Record<string, boolean> = {}, initialSettings: unk
     }
     await events.get("session_start")!({}, ctx);
     return {
-        ctx, notices,
+        ctx, notices, statuses, authMethods,
         restartSession: () => events.get("session_start")!({}, ctx),
         settings: (value: unknown) => { settings = value; },
         auth: (value: { oauth?: boolean; token?: string; headers?: Record<string, string>; error?: boolean }) => {
@@ -105,7 +110,7 @@ describe("OpenAI service tiers", () => {
         const saved = readFileSync(join(dir, "fast-state.json"), "utf8");
         await h.command("fast", "status");
         await h.command("fast", "invalid");
-        h.auth({ oauth: false });
+        h.settings({ fast: { ultrafastModels: [] } });
         await h.command("ultrafast", "on");
         expect(readFileSync(join(dir, "fast-state.json"), "utf8")).toBe(saved);
     });
@@ -205,51 +210,75 @@ describe("OpenAI service tiers", () => {
         expect((await h.request()).service_tier).toBe("priority");
     });
 
-    test("only exact promax plan is eligible; no guessing from Pro or Pro500 labels", async () => {
-        const h = await harness({ ultrafast: true });
-        for (const plan of ["free", "plus", "pro", "prolite", "pro500", "enterprise", "ProMax", null]) {
-            h.auth({ token: jwt(plan) });
-            expect((await h.request()).service_tier).toBe("default");
-        }
-        h.auth({ token: jwt("promax") });
-        expect((await h.request()).service_tier).toBe("ultrafast");
-    });
-
-    test("API keys cannot enable ultrafast, even if a separate ChatGPT account exists", async () => {
-        const h = await harness({ fast: true });
-        h.auth({ oauth: false, token: jwt() });
+    test.each(["openai", "openai-codex"])("opaque OAuth tokens can enable ultrafast on %s", async (provider) => {
+        const h = await harness();
+        await h.model(provider, "gpt-6-astra");
         await h.command("ultrafast", "on");
-        expect(h.notices.at(-1)).toContain("API-key authentication is not eligible");
-        expect((await h.request()).service_tier).toBe("priority");
+        expect((await h.request()).service_tier).toBe("ultrafast");
+        expect(h.statuses.at(-1)).toBe("ultrafast");
+        await h.command("ultrafast", "status");
+        expect(h.notices.at(-1)).toBe("OpenAI service tier: ultrafast");
+        expect(h.notices.join("\n")).not.toContain("unexpired plan claim");
+        expect(h.authMethods.isUsingOAuth).not.toHaveBeenCalled();
+        expect(h.authMethods.getApiKeyAndHeaders).not.toHaveBeenCalled();
     });
 
-    test("missing, malformed, expired tokens and auth failures fail closed without leaking details", async () => {
+    test("subscription entitlement is left to OpenAI, not inferred from token plan claims", async () => {
         const h = await harness({ ultrafast: true });
-        for (const token of [undefined, "opaque-token", "x.invalid-json.x", jwt("promax", 1), jwt("promax", NaN)]) {
+        for (const plan of ["promax", "pro", "prolite", "pro500", "enterprise", "edu", "plus", "free", null]) {
+            h.auth({ token: jwt(plan) });
+            expect((await h.request()).service_tier).toBe("ultrafast");
+        }
+        expect(h.notices).toEqual([]);
+        expect(h.authMethods.getApiKeyAndHeaders).not.toHaveBeenCalled();
+    });
+
+    test("API keys can select ultrafast without a ChatGPT subscription", async () => {
+        const h = await harness({ fast: true });
+        h.auth({ oauth: false, token: "sk-test-api-key" });
+        await h.command("ultrafast", "on");
+        expect((await h.request()).service_tier).toBe("ultrafast");
+        expect(h.statuses.at(-1)).toBe("ultrafast");
+        expect(h.notices.at(-1)).toContain("OpenAI service tier: ultrafast");
+        expect(h.authMethods.isUsingOAuth).not.toHaveBeenCalled();
+        expect(h.authMethods.getApiKeyAndHeaders).not.toHaveBeenCalled();
+    });
+
+    test("token format and expiry do not block ultrafast; Pi owns credential resolution and refresh", async () => {
+        const h = await harness({ ultrafast: true });
+        const noPlan = `header.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64url")}.signature`;
+        for (const token of [undefined, "opaque-token", "x.invalid-json.x", noPlan, jwt("promax", 1), jwt("promax", NaN)]) {
             h.auth({ token });
-            expect((await h.request()).service_tier).toBe("default");
+            expect((await h.request()).service_tier).toBe("ultrafast");
         }
         h.auth({ error: true });
-        expect((await h.request()).service_tier).toBe("default");
-        expect(h.notices.join("\n")).not.toContain("sensitive-token-details");
+        await h.restartSession();
+        await h.command("ultrafast", "status");
+        expect((await h.request()).service_tier).toBe("ultrafast");
+        expect(h.authMethods.getApiKeyAndHeaders).not.toHaveBeenCalled();
+        expect(h.notices).toEqual(["OpenAI service tier: ultrafast"]);
     });
 
-    test("checks active bearer header instead of a conflicting apiKey", async () => {
+    test("authorization headers are not inspected or exposed by the extension", async () => {
         const h = await harness({ ultrafast: true });
         h.auth({ token: jwt(), headers: { Authorization: `Bearer ${jwt("plus")}` } });
-        expect((await h.request()).service_tier).toBe("default");
-        h.auth({ headers: { authorization: `Bearer ${jwt()}` } });
         expect((await h.request()).service_tier).toBe("ultrafast");
-        h.auth({ token: jwt(), headers: { Authorization: "Basic not-a-chatgpt-token" } });
-        expect((await h.request()).service_tier).toBe("default");
+        h.auth({ headers: { authorization: "Bearer opaque-token" } });
+        expect((await h.request()).service_tier).toBe("ultrafast");
+        h.auth({ token: jwt(), headers: { Authorization: "Basic sensitive-token-details" } });
+        expect((await h.request()).service_tier).toBe("ultrafast");
+        expect(h.authMethods.getApiKeyAndHeaders).not.toHaveBeenCalled();
+        expect(h.notices).toEqual([]);
     });
 
-    test("subscription changes are rechecked before each request and off remains usable", async () => {
+    test("credential changes preserve the selection; off and fast remain usable", async () => {
         const h = await harness({ ultrafast: true });
         h.auth({ token: jwt("pro") });
-        expect((await h.request()).service_tier).toBe("default");
+        expect((await h.request()).service_tier).toBe("ultrafast");
+        h.auth({ oauth: false, token: "sk-test-api-key" });
+        expect((await h.request()).service_tier).toBe("ultrafast");
         await h.command("ultrafast", "status");
-        expect(h.notices.at(-1)).toContain("inactive");
+        expect(h.notices.at(-1)).toBe("OpenAI service tier: ultrafast");
         await h.command("ultrafast", "off");
         expect((await h.request()).service_tier).toBe("default");
         await h.command("fast", "on");

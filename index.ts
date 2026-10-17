@@ -13,41 +13,6 @@ function isObject(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-// Local eligibility hint only, not JWT signature verification or server authorization.
-function tokenPlan(token: string | undefined): string | undefined {
-    try {
-        const parts = token?.split(".");
-        if (parts?.length !== 3 || !parts[1]) return undefined;
-        const claims: unknown = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
-        if (!isObject(claims)) return undefined;
-        if (typeof claims.exp !== "number" || !Number.isFinite(claims.exp) || claims.exp * 1000 <= Date.now()) return undefined;
-        const auth = claims["https://api.openai.com/auth"];
-        return isObject(auth) && typeof auth.chatgpt_plan_type === "string" ? auth.chatgpt_plan_type : undefined;
-    } catch {
-        return undefined;
-    }
-}
-
-async function subscriptionReason(ctx: ExtensionContext): Promise<string | undefined> {
-    const required = "Ultrafast requires a ChatGPT Pro Max (promax / Pro500) subscription.";
-    try {
-        if (!ctx.model || !ctx.modelRegistry.isUsingOAuth(ctx.model)) return `${required} API-key authentication is not eligible.`;
-        // Resolve the active model's auth through Pi (including OAuth refresh), not a separate auth.json file.
-        const resolved = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
-        if (!resolved.ok) return `${required} Could not determine the active subscription.`;
-        const authorization = Object.entries(resolved.headers ?? {}).find(([name]) => name.toLowerCase() === "authorization")?.[1];
-        const bearer = typeof authorization === "string" ? /^Bearer\s+(.+)$/i.exec(authorization)?.[1] : undefined;
-        const plan = tokenPlan(authorization !== undefined ? bearer : resolved.apiKey);
-        if (plan === "promax") return undefined;
-        return plan === undefined
-            ? `${required} The active OAuth token does not expose a readable, unexpired plan claim; ultrafast is disabled.`
-            : `${required} The active subscription is not Pro Max.`;
-    } catch {
-        // Never surface auth errors: they can contain tokens or other credential details.
-        return `${required} Could not determine the active subscription.`;
-    }
-}
-
 export default function fastExtension(pi: ExtensionAPI): void {
     // User-wide preference, separate from settings and conversation history.
     const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
@@ -124,7 +89,8 @@ export default function fastExtension(pi: ExtensionAPI): void {
             } catch (error) {
                 return error instanceof Error ? error.message : String(error);
             }
-            return subscriptionReason(ctx);
+            // Access-token plan claims are not a reliable entitlement API. Pi handles
+            // credentials and refresh; OpenAI enforces subscription/workspace or API access.
         }
         return undefined;
     }
