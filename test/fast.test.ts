@@ -12,6 +12,7 @@ function stateDirectory(): string {
 afterAll(() => stateDirs.forEach(dir => rmSync(dir, { recursive: true, force: true })));
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import fastExtension from "../index.ts";
+import type { AssistantMessage, ModelCost } from "@earendil-works/pi-ai";
 
 function jwt(plan: unknown = "promax", exp = Math.floor(Date.now() / 1000) + 3600): string {
     const payload = { exp, "https://api.openai.com/auth": { chatgpt_plan_type: plan } };
@@ -42,9 +43,14 @@ async function harness(flags: Record<string, boolean> = {}, initialSettings: unk
         getSettings: () => settings,
         registerCommand: (name: string, options: any) => commands.set(name, options.handler),
     } as unknown as ExtensionAPI;
+    let modelCost: ModelCost = { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 };
     const ctx = {
-        model: { provider: "openai", id: "gpt-6-astra" },
-        modelRegistry: authMethods,
+        model: { provider: "openai", id: "gpt-6-astra", api: "openai-responses" },
+        modelRegistry: {
+            ...authMethods,
+            find: (provider: string, id: string) => ["gpt-6-astra", "gpt-6.1-sol"].includes(id)
+                ? { provider, id, cost: modelCost } : undefined,
+        },
         hasUI: true,
         ui: {
             notify: (message: string) => notices.push(message),
@@ -64,6 +70,7 @@ async function harness(flags: Record<string, boolean> = {}, initialSettings: unk
         ctx, notices, statuses, authMethods,
         restartSession: () => events.get("session_start")!({}, ctx),
         settings: (value: unknown) => { settings = value; },
+        prices: (value: ModelCost) => { modelCost = value; },
         auth: (value: { oauth?: boolean; token?: string; headers?: Record<string, string>; error?: boolean }) => {
             oauth = value.oauth ?? true;
             token = value.token;
@@ -71,12 +78,16 @@ async function harness(flags: Record<string, boolean> = {}, initialSettings: unk
             authError = value.error ?? false;
         },
         model: async (provider: string, id: string) => {
-            Object.assign(ctx.model!, { provider, id });
+            Object.assign(ctx.model!, { provider, id, api: provider === "openai-codex" ? "openai-codex-responses" : "openai-responses" });
             await events.get("model_select")!({}, ctx);
         },
         command: (name: string, args = "") => commands.get(name)!(args, ctx),
         request: async (payload: unknown = { model: ctx.model?.id, input: [] }) =>
             events.get("before_provider_request")!({ type: "before_provider_request", payload }, ctx),
+        stream: (data: unknown, provider = ctx.model!.provider, model = ctx.model!.id) =>
+            events.get("provider_stream_event")?.({ type: "provider_stream_event", provider, model, api: ctx.model?.api, data }, ctx),
+        end: async <T>(message: T): Promise<T> =>
+            (await events.get("message_end")?.({ type: "message_end", message }, ctx))?.message ?? message,
     };
 }
 
@@ -283,5 +294,190 @@ describe("OpenAI service tiers", () => {
         expect((await h.request()).service_tier).toBe("default");
         await h.command("fast", "on");
         expect((await h.request()).service_tier).toBe("priority");
+    });
+});
+
+function assistant(provider = "openai-codex", responseId = "resp_1"): AssistantMessage {
+    return {
+        role: "assistant", provider, model: "gpt-6-astra",
+        api: provider === "openai-codex" ? "openai-codex-responses" : "openai-responses",
+        responseId, content: [{ type: "text", text: "hello" }], timestamp: 1, stopReason: "stop",
+        usage: {
+            input: 1000, output: 500, cacheRead: 2000, cacheWrite: 100, reasoning: 100, totalTokens: 3600,
+            cost: { input: 0.01, output: 0.025, cacheRead: 0.002, cacheWrite: 0.00125, total: 0.03825 },
+        },
+    };
+}
+
+describe("Ultrafast usage cost estimates", () => {
+    test.each([["openai-codex", 8], ["openai", 6]] as const)("%s records standard cost times %i without changing tokens", async (provider, multiplier) => {
+        const h = await harness({ ultrafast: true });
+        await h.model(provider, "gpt-6-astra");
+        await h.request();
+        await h.stream({ type: "response.completed", response: { id: "resp_1", service_tier: "ultrafast" } });
+        const original = assistant(provider);
+        Object.freeze(original.usage.cost);
+        Object.freeze(original.usage);
+        Object.freeze(original);
+        const result = await h.end(original);
+        for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) {
+            expect(result.usage.cost[key]).toBeCloseTo(original.usage.cost[key] * multiplier, 10);
+        }
+        expect({ ...result.usage, cost: undefined }).toEqual({ ...original.usage, cost: undefined });
+        expect(result.content).toEqual(original.content);
+        expect(original.usage.cost.total).toBe(0.03825);
+        // This is the message Pi persists and uses in its footer/session usage totals.
+        expect(JSON.parse(JSON.stringify(result)).usage.cost.total).toBeCloseTo(0.03825 * multiplier, 10);
+    });
+
+    test("uses configured catalog rates and long-context pricing, including cached prompt tokens", async () => {
+        const h = await harness({ ultrafast: true });
+        await h.model("openai-codex", "gpt-6-astra");
+        h.prices({
+            input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5,
+            tiers: [{ inputTokensAbove: 272000, input: 20, output: 75, cacheRead: 2, cacheWrite: 25 }],
+        });
+        await h.request();
+        await h.stream({ type: "response.completed", response: { id: "resp_1", service_tier: "ultrafast" } });
+        const message = assistant();
+        message.usage.input = 270000;
+        message.usage.cacheRead = 2001;
+        message.usage.totalTokens = 272601;
+        const result = await h.end(message);
+        expect(result.usage.cost.total).toBeCloseTo((270000 * 20 + 500 * 75 + 2001 * 2 + 100 * 25) / 1000000 * 8, 10);
+    });
+
+    test("recalculates instead of compounding native or previously adjusted costs", async () => {
+        const h = await harness({ ultrafast: true });
+        await h.model("openai-codex", "gpt-6-astra");
+        await h.request();
+        await h.stream({ type: "response.completed", response: { id: "resp_1", service_tier: "ultrafast" } });
+        const message = assistant();
+        for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) message.usage.cost[key] *= 8;
+        const first = await h.end(message);
+        expect(first.usage.cost.total).toBeCloseTo(0.03825 * 8, 10);
+        expect(await h.end(first)).toEqual(first);
+    });
+
+    test("uses the sent tier when omitted, even after toggling off and changing models in flight", async () => {
+        const h = await harness({ ultrafast: true });
+        await h.model("openai-codex", "gpt-6-astra");
+        await h.request();
+        await h.command("ultrafast", "off");
+        await h.stream({ type: "response.created", response: { id: "resp_1" } });
+        await h.model("anthropic", "claude");
+        expect((await h.end(assistant())).usage.cost.total).toBeCloseTo(0.03825 * 8, 10);
+    });
+
+    test.each(["default", "priority", "fast", "flex"])("respects the server's %s tier rather than charging ultrafast", async (tier) => {
+        const h = await harness({ ultrafast: true });
+        await h.model("openai-codex", "gpt-6-astra");
+        await h.request();
+        await h.stream({ type: "response.created", response: { id: "resp_1", service_tier: "ultrafast" } });
+        await h.stream({ type: "response.completed", response: { id: "resp_1", service_tier: tier } });
+        const message = assistant();
+        expect(await h.end(message)).toBe(message);
+    });
+
+    test("inactive ultrafast selections and fast mode keep Pi's existing costs", async () => {
+        const h = await harness({ ultrafast: true }, { fast: { ultrafastModels: [] } });
+        await h.model("openai-codex", "gpt-6-astra");
+        expect((await h.request()).service_tier).toBe("default");
+        await h.stream({ type: "response.completed", response: { id: "resp_1" } });
+        const message = assistant();
+        expect(await h.end(message)).toBe(message);
+        await h.command("fast", "on");
+        await h.request();
+        await h.stream({ type: "response.completed", response: { id: "resp_2", service_tier: "priority" } });
+        const priority = assistant("openai-codex", "resp_2");
+        priority.usage.cost.total *= 2;
+        expect(await h.end(priority)).toBe(priority);
+    });
+
+    test("response IDs keep overlapping replies separate and retries can reuse a request", async () => {
+        const h = await harness({ ultrafast: true });
+        await h.model("openai-codex", "gpt-6-astra");
+        await h.request();
+        await h.stream({ type: "response.created", response: { id: "retry" } });
+        await h.stream({ type: "response.created", response: { id: "resp_1" } });
+        await h.command("ultrafast", "off");
+        await h.request();
+        await h.stream({ type: "response.created", response: { id: "resp_2" } });
+        await h.stream({ type: "response.completed", response: { id: "resp_1" } });
+        expect((await h.end(assistant())).usage.cost.total).toBeCloseTo(0.03825 * 8, 10);
+        const standard = assistant("openai-codex", "resp_2");
+        expect(await h.end(standard)).toBe(standard);
+    });
+
+    test.each(["response.done", "response.incomplete", "response.completed"])("handles Codex %s responses and non-stop completions", async (type) => {
+        const h = await harness({ ultrafast: true });
+        await h.model("openai-codex", "gpt-6-astra");
+        await h.request();
+        await h.stream({ type, response: { id: "resp_1" } });
+        const message = assistant();
+        message.stopReason = "length";
+        expect((await h.end(message)).usage.cost.total).toBeCloseTo(0.03825 * 8, 10);
+    });
+
+    test("zero-usage failures stay zero; unrelated, untracked, and unknown-model messages stay unchanged", async () => {
+        const h = await harness({ ultrafast: true });
+        await h.model("openai-codex", "gpt-6-astra");
+        await h.request();
+        const untracked = assistant();
+        expect(await h.end(untracked)).toBe(untracked);
+        await h.stream({ type: "response.completed", response: { id: "resp_1", service_tier: "ultrafast" } });
+        const other = assistant("anthropic");
+        expect(await h.end(other)).toBe(other);
+        const unknown = { ...assistant(), model: "unknown-model" };
+        await h.stream({ type: "response.completed", response: { id: "resp_1", service_tier: "ultrafast" } }, "openai-codex", "unknown-model");
+        expect(await h.end(unknown)).toBe(unknown);
+        const user = { role: "user", content: "hello", timestamp: 1 };
+        expect(await h.end(user)).toBe(user);
+        const failure = assistant();
+        delete failure.responseId;
+        failure.stopReason = "error";
+        failure.usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+        expect((await h.end(failure)).usage.cost.total).toBe(0);
+    });
+
+    test("provider/model identity separates matching response IDs; the reported tier can override the request", async () => {
+        const h = await harness();
+        await h.model("openai-codex", "gpt-6-astra");
+        await h.request();
+        await h.stream({ type: "response.completed", response: { id: "resp_1", service_tier: "ultrafast" } });
+        await h.model("openai", "gpt-6-astra");
+        await h.request();
+        await h.stream({ type: "response.completed", response: { id: "resp_1", service_tier: "default" } });
+        const api = assistant("openai");
+        expect(await h.end(api)).toBe(api);
+        expect((await h.end(assistant())).usage.cost.total).toBeCloseTo(0.03825 * 8, 10);
+    });
+
+    test("unmatched background responses use bounded bookkeeping and malformed stream events are ignored", async () => {
+        const h = await harness({ ultrafast: true });
+        await h.model("openai-codex", "gpt-6-astra");
+        await h.request();
+        for (const data of [null, [], {}, { type: "response.completed" },
+            { type: "response.completed", response: { id: 123 } },
+            { type: "response.output_text.delta", response: { id: "unrelated", service_tier: "ultrafast" } }]) {
+            await h.stream(data);
+        }
+        for (let i = 0; i < 65; i++) {
+            await h.stream({ type: "response.completed", response: { id: `resp_${i}` } });
+        }
+        const evicted = assistant("openai-codex", "resp_0");
+        expect(await h.end(evicted)).toBe(evicted);
+        expect((await h.end(assistant("openai-codex", "resp_64"))).usage.cost.total).toBeCloseTo(0.03825 * 8, 10);
+    });
+
+    test("a new session drops old response bookkeeping", async () => {
+        const h = await harness({ ultrafast: true });
+        await h.model("openai-codex", "gpt-6-astra");
+        await h.request();
+        await h.stream({ type: "response.created", response: { id: "resp_1" } });
+        await h.restartSession();
+        const old = assistant();
+        expect(await h.end(old)).toBe(old);
     });
 });

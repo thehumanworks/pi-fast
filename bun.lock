@@ -5,10 +5,12 @@
     "": {
       "name": "fast",
       "devDependencies": {
+        "@earendil-works/pi-ai": "^1.0.4",
         "@earendil-works/pi-coding-agent": "^1.0.4",
         "@types/bun": "latest",
       },
       "peerDependencies": {
+        "@earendil-works/pi-ai": "*",
         "@earendil-works/pi-coding-agent": "*",
         "typescript": "^7",
       },

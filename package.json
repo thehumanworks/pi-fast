@@ -11,10 +11,12 @@
     "check": "tsc --noEmit"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "^1.0.4",
     "@types/bun": "latest",
     "@earendil-works/pi-coding-agent": "^1.0.4"
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "typescript": "^7"
   },

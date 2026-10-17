@@ -133,9 +133,42 @@ Ultrafast is sent only for allowlisted models. Endpoint acceptance and model
 availability still depend on server-side access. A rejecting endpoint will
 return an API error; there is no silent retry with a different paid tier.
 
-Pi's existing service-tier cost adjustments recognize `priority`/`flex`, but
-ultrafast cost estimates may not reflect actual billing. Check actual
-availability and billing with your endpoint.
+## Usage cost estimates
+
+Pi's built-in tier pricing does not currently recognize Ultrafast. This extension
+corrects `usage.cost` on finalized Ultrafast assistant responses before Pi
+persists them, so the footer, session usage totals, and exports include the
+premium:
+
+| Provider | Ultrafast estimate relative to Standard |
+| --- | --- |
+| `openai-codex` | **8×**, representing included ChatGPT subscription usage |
+| `openai` | **6×**, representing API token pricing |
+
+All cost components (input, output, cache reads, and cache writes) are repriced
+from Pi's effective model catalog, including custom prices and long-context
+tiers. Existing costs are not multiplied blindly, avoiding double-counting if
+Pi or another copy of the extension already applied the premium. Actual token
+counts, reasoning counts, and context-window usage remain unchanged.
+
+The returned response tier takes precedence, including an explicit `default`
+downgrade. If the response omits the tier, the extension uses the tier recorded
+for that response from the outgoing request, not the current toggle. Changing
+models or turning Ultrafast off during a response does not reprice that response.
+Fast and other tiers retain Pi's own pricing behavior.
+
+These are **estimates**, not an invoice or a modification of OpenAI's reported
+account usage. Codex uses 8× to reflect included subscription consumption; paid
+credits and eligible Enterprise/Edu usage are charged at 6× instead. Pi does
+not expose which allowance is being consumed, so the extension cannot switch
+that estimate automatically. See the [speed guide](https://learn.chatgpt.com/docs/agent-configuration/speed)
+and [API pricing](https://developers.openai.com/api/docs/pricing).
+
+The correction applies only to new assistant responses observed by this
+extension. Historical messages are not repriced. Unmatched responses are left
+unchanged. Background cache-warming usage is recorded separately by Pi without
+an editable `message_end` hook and is **not** corrected here; compaction,
+summaries, and nested-tool usage also retain their own pricing.
 
 ## Development
 
@@ -149,4 +182,7 @@ Tests cover persistent on/off state, startup overrides, storage errors,
 flags, mutually exclusive toggles, configuration, model changes,
 payload preservation, provider isolation, opaque OAuth tokens, API-key support,
 credential changes, and leaving token format, expiry, refresh, and entitlement
-to Pi/OpenAI without inspecting credentials or making network requests.
+to Pi/OpenAI without inspecting credentials or making network requests. Cost
+tests cover the 8×/6× premiums, all cost components, long-context rates,
+unchanged token counts, in-flight toggles, server-reported downgrades, retries,
+and avoiding double-counting.

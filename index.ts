@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { calculateCost } from "@earendil-works/pi-ai";
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -8,6 +9,7 @@ type Tier = "default" | "fast" | "ultrafast";
 
 const DEFAULT_ULTRAFAST_MODELS = ["gpt-6-astra"];
 const OPENAI_PROVIDERS = new Set(["openai", "openai-codex"]);
+const MAX_TRACKED_TIERS = 64;
 
 function isObject(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -20,6 +22,14 @@ export default function fastExtension(pi: ExtensionAPI): void {
     let selected: Tier = "default";
     let initialized = false;
     let lastWarning: string | undefined;
+    const requestTiers = new Map<string, string>();
+    const responseTiers = new Map<string, string>();
+
+    function rememberTier(tiers: Map<string, string>, key: string, tier: string): void {
+        tiers.set(key, tier);
+        // Retries and cache-warm responses need not produce a message_end event.
+        if (tiers.size > MAX_TRACKED_TIERS) tiers.delete(tiers.keys().next().value!);
+    }
 
     function storageWarning(ctx: ExtensionContext, message: string): void {
         if (ctx.hasUI) ctx.ui.notify(message, "warning");
@@ -142,6 +152,8 @@ export default function fastExtension(pi: ExtensionAPI): void {
     }
 
     pi.on("session_start", async (_event, ctx) => {
+        requestTiers.clear();
+        responseTiers.clear();
         // Flags are parsed after the factory runs; apply them only at initial startup.
         if (!initialized) {
             selected = loadSelection(ctx);
@@ -181,6 +193,46 @@ export default function fastExtension(pi: ExtensionAPI): void {
         // The hook returns the replacement payload itself, not { payload: ... }.
         // /fast is the user-facing mode; priority is its compatible wire value.
         const serviceTier = reason ? "default" : selected === "fast" ? "priority" : selected;
+        rememberTier(requestTiers, `${ctx.model.provider}/${ctx.model.id}`, serviceTier);
         return { ...event.payload, service_tier: serviceTier };
+    });
+
+    pi.on("provider_stream_event", (event) => {
+        if (!OPENAI_PROVIDERS.has(event.provider) || !isObject(event.data)) return;
+        const data = event.data;
+        if (data.type !== "response.created" && data.type !== "response.completed" &&
+            data.type !== "response.done" && data.type !== "response.incomplete") return;
+        if (!isObject(data.response) || typeof data.response.id !== "string") return;
+        const modelKey = `${event.provider}/${event.model}`;
+        const responseKey = `${modelKey}/${data.response.id}`;
+        // The server's tier wins, including an explicit downgrade to Standard.
+        // When omitted, retain the response's snapshot, not the current selection.
+        const tier = typeof data.response.service_tier === "string" ? data.response.service_tier
+            : responseTiers.get(responseKey) ?? requestTiers.get(modelKey);
+        if (tier !== undefined) rememberTier(responseTiers, responseKey, tier);
+    });
+
+    pi.on("message_end", (event, ctx) => {
+        const message = event.message;
+        if (message.role !== "assistant" || !OPENAI_PROVIDERS.has(message.provider) || !message.responseId) return;
+        const key = `${message.provider}/${message.model}/${message.responseId}`;
+        const tier = responseTiers.get(key);
+        responseTiers.delete(key);
+        if (tier !== "ultrafast") return;
+        const model = ctx.modelRegistry.find(message.provider, message.model);
+        if (!model) return;
+        // Reprice from catalog rates (including long-context tiers), rather than
+        // compounding a cost another extension or a newer Pi may already have scaled.
+        const usage = { ...message.usage, cost: { ...message.usage.cost } };
+        const cost = calculateCost(model, usage);
+        // Codex estimates included subscription usage; API prices use a 6x premium.
+        const multiplier = message.provider === "openai-codex" ? 8 : 6;
+        cost.input *= multiplier;
+        cost.output *= multiplier;
+        cost.cacheRead *= multiplier;
+        cost.cacheWrite *= multiplier;
+        cost.total = cost.input + cost.output + cost.cacheRead + cost.cacheWrite;
+        // Pi persists this replacement before updating footer/session usage totals.
+        return { message: { ...message, usage } };
     });
 }
